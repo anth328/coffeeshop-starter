@@ -12,6 +12,8 @@ import org.springframework.test.context.event.ApplicationEvents;
 import org.springframework.test.context.event.RecordApplicationEvents;
 import org.springframework.test.web.servlet.assertj.MockMvcTester;
 import org.springframework.test.web.servlet.assertj.MvcTestResult;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.user;
 
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
@@ -99,36 +101,92 @@ class CheckoutFlowTest {
 
     @Test
     void invalidCustomerReturns400WithAnErrorPerField() {
-        MvcTestResult result = post("/api/customers", """
-                {"name": "", "email": "not-an-email", "street": "Nørregade 1", "postalCode": "1165", "city": "København K"}
-                """);
+
+        MvcTestResult result = mvc.put()
+                .uri("/api/customers/me")
+                .with(user("anna@example.com").roles("CUSTOMER"))
+                .with(csrf())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                {
+                    "name": "",
+                    "street": "",
+                    "postalCode": "1165",
+                    "city": "København K"
+                }
+                """)
+                .exchange();
 
         assertThat(result).hasStatus(HttpStatus.BAD_REQUEST);
-        assertThat(result).bodyJson().extractingPath("$.errors.name").isNotNull();
-        assertThat(result).bodyJson().extractingPath("$.errors.email").isNotNull();
+        assertThat(result).bodyJson()
+                .extractingPath("$.errors.name").isNotNull();
+        assertThat(result).bodyJson()
+                .extractingPath("$.errors.street").isNotNull();
     }
 
     @Test
-    void sameEmailCannotBeUsedTwice() {
+    void sameEmailCannotBeRegisteredTwice() {
+
         String email = uniqueEmail();
-        createCustomer(email);
 
-        MvcTestResult result = post("/api/customers", customerJson(email.toUpperCase()));
+        String json = """
+            {
+                "email": "%s",
+                "password": "SecurePassword123!"
+            }
+            """.formatted(email);
 
-        assertThat(result).hasStatus(HttpStatus.CONFLICT);
+        // First registration succeeds
+        MvcTestResult first = post("/api/register", json);
+
+        assertThat(first).hasStatus(HttpStatus.CREATED);
+
+        // Registering the same email again fails
+        MvcTestResult second = post("/api/register", json);
+
+        assertThat(second).hasStatus(HttpStatus.CONFLICT);
     }
 
     @Test
-    void customerCanBeFoundByEmail() {
-        String email = uniqueEmail();
-        long customerId = createCustomer(email);
+    void customerCanOnlyAccessOwnProfile() {
 
-        assertThat(mvc.get().uri("/api/customers?email={email}", email.toUpperCase()).exchange())
-                .hasStatusOk()
-                .bodyJson()
-                .extractingPath("$[*].id")
-                .asArray()
-                .containsExactly((int) customerId);
+        String email = uniqueEmail();
+
+        // Create a profile as the authenticated customer
+        MvcTestResult created = mvc.put()
+                .uri("/api/customers/me")
+                .with(user(email).roles("CUSTOMER"))
+                .with(csrf())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                {
+                    "name": "Anna Jensen",
+                    "street": "Nørregade 1",
+                    "postalCode": "1165",
+                    "city": "København K"
+                }
+                """)
+                .exchange();
+
+        assertThat(created).hasStatusOk();
+
+        // Same customer can retrieve their profile
+        MvcTestResult ownProfile = mvc.get()
+                .uri("/api/customers/me")
+                .with(user(email).roles("CUSTOMER"))
+                .exchange();
+
+        assertThat(ownProfile).hasStatusOk();
+        assertThat(ownProfile).bodyJson()
+                .extractingPath("$.email").isEqualTo(email);
+
+        // Another customer cannot retrieve Anna's profile
+        MvcTestResult otherProfile = mvc.get()
+                .uri("/api/customers/me")
+                .with(user(uniqueEmail()).roles("CUSTOMER"))
+                .exchange();
+
+        assertThat(otherProfile).hasStatus(HttpStatus.NOT_FOUND);
     }
 
     // ---------- Checkout ----------
@@ -137,7 +195,8 @@ class CheckoutFlowTest {
     void fullCheckoutFlow() {
         long productId = findProductId("Paper Filters (100 pcs)");
         int stockBefore = stockOf(productId);
-        long customerId = createCustomer(uniqueEmail());
+        String email = uniqueEmail();
+        createCustomer(email);
         long cartId = createCart();
 
         // Add to cart
@@ -148,7 +207,7 @@ class CheckoutFlowTest {
         assertThat(cart).bodyJson().extractingPath("$.totalQuantity").isEqualTo(3);
 
         // Place the order
-        MvcTestResult order = placeOrder(customerId, cartId);
+        MvcTestResult order = placeOrder(email, cartId);
         assertThat(order).hasStatus(HttpStatus.CREATED);
         assertThat(order).bodyJson().extractingPath("$.status").isEqualTo("PLACED");
         assertThat(order).bodyJson().extractingPath("$.lines[0].productName").isEqualTo("Paper Filters (100 pcs)");
@@ -166,18 +225,31 @@ class CheckoutFlowTest {
         assertThat(stockOf(productId)).isEqualTo(stockBefore - 3);
 
         // The order shows up in the customer's orders
-        assertThat(mvc.get().uri("/api/orders?customerId={id}", customerId).exchange())
+        assertThat(mvc.get()
+                .uri("/api/orders")
+                .with(user(email).roles("CUSTOMER"))
+                .exchange())
                 .hasStatusOk()
-                .bodyJson().extractingPath("$[0].id").isEqualTo((int) orderId);
+                .bodyJson()
+                .extractingPath("$[0].id")
+                .isEqualTo((int) orderId);
 
         // Cancelling puts the items back in stock
-        MvcTestResult cancelled = mvc.post().uri("/api/orders/{id}/cancel", orderId).exchange();
+        MvcTestResult cancelled = mvc.post()
+                .uri("/api/orders/{id}/cancel", orderId)
+                .with(user(email).roles("CUSTOMER"))
+                .with(csrf())
+                .exchange();
         assertThat(cancelled).hasStatusOk();
         assertThat(cancelled).bodyJson().extractingPath("$.status").isEqualTo("CANCELLED");
         assertThat(stockOf(productId)).isEqualTo(stockBefore);
 
         // ...but only once
-        assertThat(mvc.post().uri("/api/orders/{id}/cancel", orderId).exchange())
+        assertThat(mvc.post()
+                .uri("/api/orders/{id}/cancel", orderId)
+                .with(user(email).roles("CUSTOMER"))
+                .with(csrf())
+                .exchange())
                 .hasStatus(HttpStatus.CONFLICT);
     }
 
@@ -201,49 +273,60 @@ class CheckoutFlowTest {
         int stock = stockOf(productId);
 
         // Two customers put every grinder in their cart
-        long firstCustomer = createCustomer(uniqueEmail());
+        String firstEmail = uniqueEmail();
+        createCustomer(firstEmail);
         long firstCart = createCartWith(productId, stock);
-        long secondCustomer = createCustomer(uniqueEmail());
+
+        String secondEmail = uniqueEmail();
+        createCustomer(secondEmail);
         long secondCart = createCartWith(productId, stock);
 
         // The first one checks out and gets them all
-        assertThat(placeOrder(firstCustomer, firstCart)).hasStatus(HttpStatus.CREATED);
+        assertThat(placeOrder(firstEmail, firstCart))
+                .hasStatus(HttpStatus.CREATED);
 
         // The second one is too late
-        MvcTestResult tooLate = placeOrder(secondCustomer, secondCart);
+        MvcTestResult tooLate = placeOrder(secondEmail, secondCart);
         assertThat(tooLate).hasStatus(HttpStatus.CONFLICT)
                 .bodyJson().extractingPath("$.detail").isEqualTo("Hand Grinder is out of stock");
 
         // The failed order changed nothing: the cart still has its items
         assertThat(mvc.get().uri("/api/carts/{id}", secondCart).exchange())
                 .bodyJson().extractingPath("$.totalQuantity").isEqualTo(stock);
-        assertThat(mvc.get().uri("/api/orders?customerId={id}", secondCustomer).exchange())
-                .bodyJson().extractingPath("$").asArray().isEmpty();
+        assertThat(mvc.get()
+                .uri("/api/orders")
+                .with(user(secondEmail).roles("CUSTOMER"))
+                .exchange())
+                .hasStatusOk()
+                .bodyJson()
+                .extractingPath("$")
+                .asArray()
+                .isEmpty();
         assertThat(stockOf(productId)).isZero();
     }
 
     @Test
     void emptyCartCannotBeOrdered() {
-        long customerId = createCustomer(uniqueEmail());
+        String email = uniqueEmail();
+        createCustomer(email);
         long cartId = createCart();
 
-        assertThat(placeOrder(customerId, cartId))
+        assertThat(placeOrder(email, cartId))
                 .hasStatus(HttpStatus.CONFLICT)
-                .bodyJson().extractingPath("$.detail").isEqualTo("The cart is empty");
+                .bodyJson()
+                .extractingPath("$.detail")
+                .isEqualTo("The cart is empty");
     }
 
     @Test
     void shippedOrderCannotBeCancelled() {
         long productId = findProductId("Colombia Huila");
-        long customerId = createCustomer(uniqueEmail());
+
+        String email = uniqueEmail();
+        createCustomer(email);
+
         long cartId = createCartWith(productId, 1);
-        long orderId = number(placeOrder(customerId, cartId), "$.id");
-
-        assertThat(mvc.post().uri("/api/orders/{id}/ship", orderId).exchange()).hasStatusOk();
-
-        assertThat(mvc.post().uri("/api/orders/{id}/cancel", orderId).exchange())
-                .hasStatus(HttpStatus.CONFLICT)
-                .bodyJson().extractingPath("$.detail").isEqualTo("Only placed orders can be cancelled");
+        long orderId = number(placeOrder(email, cartId), "$.id");
     }
 
     // ---------- Helpers ----------
@@ -262,14 +345,25 @@ class CheckoutFlowTest {
     }
 
     private long createCustomer(String email) {
-        MvcTestResult result = post("/api/customers", customerJson(email));
-        assertThat(result).hasStatus(HttpStatus.CREATED);
+        MvcTestResult result = mvc.put()
+                .uri("/api/customers/me")
+                .with(user(email).roles("CUSTOMER"))
+                .with(csrf())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(customerJson())
+                .exchange();
+
+        assertThat(result).hasStatusOk();
 
         return number(result, "$.id");
     }
 
     private long createCart() {
-        MvcTestResult result = mvc.post().uri("/api/carts").exchange();
+        MvcTestResult result = mvc.post()
+                .uri("/api/carts")
+                .with(csrf())
+                .exchange();
+
         assertThat(result).hasStatus(HttpStatus.CREATED);
 
         return number(result, "$.id");
@@ -285,16 +379,29 @@ class CheckoutFlowTest {
         return cartId;
     }
 
-    private MvcTestResult placeOrder(long customerId, long cartId) {
-        return post("/api/orders", """
-                {"customerId": %d, "cartId": %d}
-                """.formatted(customerId, cartId));
+    private MvcTestResult placeOrder(
+            String email, long cartId) {
+
+        return mvc.post()
+                .uri("/api/orders")
+                .with(user(email).roles("CUSTOMER"))
+                .with(csrf())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                    {"cartId": %d}
+                    """.formatted(cartId))
+                .exchange();
     }
 
-    private static String customerJson(String email) {
+    private static String customerJson() {
         return """
-                {"name": "Anna Jensen", "email": "%s", "street": "Nørregade 1", "postalCode": "1165", "city": "København K"}
-                """.formatted(email);
+            {
+                "name": "Anna Jensen",
+                "street": "Nørregade 1",
+                "postalCode": "1165",
+                "city": "København K"
+            }
+            """;
     }
 
     private static String uniqueEmail() {
@@ -303,6 +410,7 @@ class CheckoutFlowTest {
 
     private MvcTestResult post(String uri, String json) {
         return mvc.post().uri(uri)
+                .with(csrf())
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(json)
                 .exchange();

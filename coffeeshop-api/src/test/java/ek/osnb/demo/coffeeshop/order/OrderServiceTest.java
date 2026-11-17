@@ -7,6 +7,7 @@ import ek.osnb.demo.coffeeshop.catalog.CatalogApi;
 import ek.osnb.demo.coffeeshop.catalog.InsufficientStockException;
 import ek.osnb.demo.coffeeshop.catalog.ProductInfo;
 import ek.osnb.demo.coffeeshop.common.ConflictException;
+import ek.osnb.demo.coffeeshop.common.NotFoundException;
 import ek.osnb.demo.coffeeshop.customer.CustomerApi;
 import ek.osnb.demo.coffeeshop.customer.CustomerInfo;
 import org.junit.jupiter.api.Test;
@@ -74,7 +75,10 @@ class OrderServiceTest {
         givenCartWithBeansAndFilters();
         when(repository.save(any(Order.class))).thenAnswer(call -> call.getArgument(0));
 
-        OrderResponse order = service.placeOrder(new PlaceOrderRequest(ANNA.id(), CART_ID));
+        OrderResponse order = service.placeOrder(
+                ANNA.id(),
+                new PlaceOrderRequest(CART_ID)
+        );
 
         assertEquals(OrderStatus.PLACED, order.status());
         assertEquals(ANNA.id(), order.customerId());
@@ -90,7 +94,10 @@ class OrderServiceTest {
         givenCartWithBeansAndFilters();
         when(repository.save(any(Order.class))).thenAnswer(call -> call.getArgument(0));
 
-        service.placeOrder(new PlaceOrderRequest(ANNA.id(), CART_ID));
+        service.placeOrder(
+                ANNA.id(),
+                new PlaceOrderRequest(CART_ID)
+        );
 
         verify(catalog).reserveStock(BEANS.id(), 2);
         verify(catalog).reserveStock(FILTERS.id(), 1);
@@ -108,7 +115,10 @@ class OrderServiceTest {
         when(carts.getCart(CART_ID)).thenReturn(new CartInfo(CART_ID, List.of()));
 
         assertThrows(ConflictException.class,
-                () -> service.placeOrder(new PlaceOrderRequest(ANNA.id(), CART_ID)));
+                () -> service.placeOrder(
+                        ANNA.id(),
+                        new PlaceOrderRequest(CART_ID)
+                ));
 
         verify(catalog, never()).reserveStock(anyLong(), anyInt());
         verify(repository, never()).save(any());
@@ -121,7 +131,10 @@ class OrderServiceTest {
                 .when(catalog).reserveStock(BEANS.id(), 2);
 
         assertThrows(InsufficientStockException.class,
-                () -> service.placeOrder(new PlaceOrderRequest(ANNA.id(), CART_ID)));
+                () -> service.placeOrder(
+                        ANNA.id(),
+                        new PlaceOrderRequest(CART_ID)
+                ));
 
         // In the real app the transaction is rolled back as well
         verify(repository, never()).save(any());
@@ -133,12 +146,25 @@ class OrderServiceTest {
 
     @Test
     void cancelPutsTheItemsBackInStock() {
-        Order order = Order.place(ANNA.id(), address(), List.of(
-                new OrderLine(BEANS.id(), BEANS.name(), BEANS.price(), 2)
-        ), Instant.now());
-        when(repository.findById(7L)).thenReturn(Optional.of(order));
+        Order order = Order.place(
+                ANNA.id(),
+                address(),
+                List.of(
+                        new OrderLine(
+                                BEANS.id(),
+                                BEANS.name(),
+                                BEANS.price(),
+                                2
+                        )
+                ),
+                Instant.now()
+        );
 
-        OrderResponse cancelled = service.cancel(7L);
+        when(repository.findByIdAndCustomerId(7L, ANNA.id()))
+                .thenReturn(Optional.of(order));
+
+        OrderResponse cancelled =
+                service.cancelOwnedOrder(ANNA.id(), 7L);
 
         assertEquals(OrderStatus.CANCELLED, cancelled.status());
         verify(catalog).releaseStock(BEANS.id(), 2);
@@ -158,5 +184,18 @@ class OrderServiceTest {
 
     private static ShippingAddress address() {
         return new ShippingAddress(ANNA.name(), ANNA.street(), ANNA.postalCode(), ANNA.city());
+    }
+
+    @Test
+    void customerCannotCancelAnotherCustomersOrder() {
+
+        when(repository.findByIdAndCustomerId(7L, 2L))
+                .thenReturn(Optional.empty());
+
+        assertThrows(NotFoundException.class,
+                () -> service.cancelOwnedOrder(2L, 7L));
+
+        verify(catalog, never())
+                .releaseStock(anyLong(), anyInt());
     }
 }

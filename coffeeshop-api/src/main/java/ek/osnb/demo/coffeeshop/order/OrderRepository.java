@@ -15,4 +15,6 @@ interface OrderRepository extends JpaRepository<Order, Long> {
     // Empty if the order doesn't exist or belongs to another customer
     @EntityGraph(attributePaths = "lines")
     Optional<Order> findByIdAndCustomerId(Long id, Long customerId);
+
+    List<Order> findAllByOrderByPlacedAtDesc();
 }

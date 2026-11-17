@@ -56,8 +56,8 @@ class OrderService implements OrderApi {
     // Everything in here happens in one transaction: if any step fails (e.g. one
     // product is out of stock), nothing is saved - no stock is taken, no order is
     // created and the cart keeps its items.
-    OrderResponse placeOrder(PlaceOrderRequest request) {
-        CustomerInfo customer = customers.getCustomer(request.customerId());
+    OrderResponse placeOrder(Long customerId, PlaceOrderRequest request) {
+        CustomerInfo customer = customers.getCustomer(customerId);
         CartInfo cart = carts.getCart(request.cartId());
 
         if (cart.isEmpty()) {
@@ -174,5 +174,36 @@ class OrderService implements OrderApi {
         }
 
         return result.get();
+    }
+
+    @Transactional(readOnly = true)
+    OrderResponse findOwnedOrder(Long customerId, Long orderId) {
+        Order order = repository.findByIdAndCustomerId(orderId, customerId)
+                .orElseThrow(() ->
+                        new NotFoundException("Order not found: " + orderId));
+
+        return OrderMapper.toResponse(order);
+    }
+
+    OrderResponse cancelOwnedOrder(Long customerId, Long orderId) {
+        Order order = repository.findByIdAndCustomerId(orderId, customerId)
+                .orElseThrow(() ->
+                        new NotFoundException("Order not found: " + orderId));
+
+        order.cancel();
+
+        for (OrderLine line : order.getLines()) {
+            catalog.releaseStock(line.getProductId(), line.getQuantity());
+        }
+
+        return OrderMapper.toResponse(order);
+    }
+
+    @Transactional(readOnly = true)
+    List<OrderSummaryResponse> findAllOrders() {
+        return repository.findAllByOrderByPlacedAtDesc()
+                .stream()
+                .map(OrderMapper::toSummary)
+                .toList();
     }
 }
